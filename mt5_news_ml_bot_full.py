@@ -1,52 +1,106 @@
 """
-MT5 ML Reversal Bot — Single File, Interactive Setup, MarketWatch Symbols
-- Terminal prompts for config (no file editing required)
-- Optional JSON save/load for setup values (including Telegram)
-- Auto-select symbols from Market Watch (or manual CSV)
-- ML training if models missing (RandomForest)
-- Reversal logic: Sweep -> CHoCH -> Confirm + Wick setups A/B
-- Gold vs FX gates: spread/ATR thresholds differ
-- Confidence scaling: Gold looser thresholds than FX
-- Controlled pyramiding (scale-in): multiple positions on SAME symbol only when in profit
-- Session filter, max trades/day, cooldown, min-hold bars before reversal
-- Live trading or alerts-only mode
-- Telegram heartbeat + scan summary + top skip reasons
+MT5 ML Reversal + Pyramiding Bot (v1 Production Rules) — Single File
 
-NOTE:
-- Storing Telegram token in JSON saves time but is plaintext. Keep the JSON private.
+⚠️ Risk note:
+- This is research/automation code, NOT a guarantee of profit.
+- Use a demo account first. Tighten limits. Expect losses.
+
+Core features:
+- Interactive terminal setup + optional JSON save/load
+- MarketWatch symbols (visible only) + broker suffix-safe (e.g., XAUUSDm)
+- ML probabilities (RandomForest) + reversal/wick setup gates
+- Per-asset gates (FX vs GOLD) for Spread/ATR/Thresholds
+- Optional pyramiding with:
+  - confidence ladder (each add needs higher confidence)
+  - session-specific aggressiveness (London/NY behavior)
+  - auto-disable pyramiding after N losses
+  - dynamic add cap based on drawdown
+  - per-add logging (“why it added / why it didn’t”)
+- SL/TP auto-set (ATR-based); optional basket TP/SL sync after adds
+- Telegram alerts + heartbeat + scan summary + top skip reasons
+- Optional manual news blackout (news_events.json)
+
+Dependencies:
+  pip install numpy pandas joblib scikit-learn MetaTrader5 requests
 """
 
 import os
+import sys
 import json
 import time
 import math
 import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, List, Tuple
 
-import requests
-import numpy as np
-import pandas as pd
-import MetaTrader5 as mt5
+# --- dependency check (friendlier errors) ---
+def _missing(mod: str) -> None:
+    print(f"\n❌ Missing module: {mod}")
+    print("Install dependencies with:")
+    print(f'  "{sys.executable}" -m pip install numpy pandas joblib scikit-learn MetaTrader5 requests')
+    print("Then re-run the bot.\n")
+    raise SystemExit(1)
 
-import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+try:
+    import requests
+except Exception:
+    _missing("requests")
+
+try:
+    import numpy as np
+except Exception:
+    _missing("numpy")
+
+try:
+    import pandas as pd
+except Exception:
+    _missing("pandas")
+
+try:
+    import joblib
+except Exception:
+    _missing("joblib")
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report
+except Exception:
+    _missing("scikit-learn")
+
+try:
+    import MetaTrader5 as mt5
+except Exception:
+    _missing("MetaTrader5")
 
 
 # =========================================================
 # Utilities
 # =========================================================
 
-def now_utc():
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def is_gold_symbol(symbol: str) -> bool:
+    # Handles XAUUSD, XAUUSDm, XAUEUR, etc.
+    s = symbol.upper()
+    return ("XAU" in s) or s.startswith("GOLD")
+
+def is_fx_symbol(symbol: str) -> bool:
+    return not is_gold_symbol(symbol)
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def prompt_str(msg, default=""):
     s = input(f"{msg} [{default}]: ").strip()
     return s if s else default
 
-def prompt_int(msg, default):
+def prompt_int(msg, default: int) -> int:
     while True:
         s = input(f"{msg} [{default}]: ").strip()
         if not s:
@@ -56,7 +110,7 @@ def prompt_int(msg, default):
         except:
             print("Enter a whole number.")
 
-def prompt_float(msg, default):
+def prompt_float(msg, default: float) -> float:
     while True:
         s = input(f"{msg} [{default}]: ").strip()
         if not s:
@@ -66,106 +120,21 @@ def prompt_float(msg, default):
         except:
             print("Enter a number (e.g., 0.005).")
 
-def prompt_yesno(msg, default="no"):
-    d = default.strip().lower()
+def prompt_yesno(msg, default="no") -> bool:
     s = input(f"{msg} (yes/no) [{default}]: ").strip().lower()
     if not s:
-        s = d
+        s = default
     return s in ("y", "yes", "true", "1")
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def safe_json_write(path: str, data: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
-
-# =========================================================
-# Config dataclass (filled via terminal prompts or JSON)
-# =========================================================
-
-@dataclass
-class Config:
-    # Telegram
-    tg_token: str
-    tg_chat_id: str
-
-    # runtime
-    live_trading: bool
-    chatty: bool
-
-    # symbols & timeframes
-    use_marketwatch: bool
-    symbols_csv: str
-    entry_tf: str
-    bias_tf: str
-
-    # risk & trade rules
-    risk_per_trade: float              # base entry risk fraction (0.005 = 0.5%)
-    max_trades_per_day: int
-    cooldown_seconds: int
-    min_bars_before_reversal: int
-
-    # session filter
-    use_session_filter: bool
-    session_start_hour: int
-    session_end_hour: int
-
-    # portfolio / positions behavior
-    one_symbol_at_a_time: bool         # if True, bot will not open trades on multiple symbols simultaneously
-    allow_multiple_positions_per_symbol: bool  # pyramiding uses multiple positions on same symbol
-
-    # per-asset gates (Gold vs FX)
-    fx_max_spread_points: int
-    gold_max_spread_points: int
-    fx_min_atr_points: float
-    gold_min_atr_points: float
-
-    # SL/TP ATR
-    sl_atr: float
-    tp_atr: float
-
-    # structure & setup params
-    ema_fast: int
-    ema_slow: int
-    swing_lookback: int
-    level_atr_dist: float
-    wick_pct: float
-    body_max_pct: float
-
-    # confidence scaling (probability thresholds)
-    fx_enter_th: float
-    gold_enter_th: float
-    fx_reverse_th: float
-    gold_reverse_th: float
-    fx_reverse_margin: float
-    gold_reverse_margin: float
-
-    # pyramiding (scale-in) settings
-    scale_in_enabled: bool
-    max_positions_per_symbol: int              # total positions (including base)
-    scale_in_min_profit_atr: float             # only add after price moves >= this * ATR in your favor
-    scale_in_min_seconds_between_adds: int     # prevents spam adds
-    scale_in_confidence_bump: float            # add only if p_dir >= enter_th + bump
-    scale_in_risk_factors_csv: str             # e.g. "1.0,0.5,0.3" base then adds
-    max_total_risk_per_symbol: float           # cap (e.g., 0.01 = 1%)
-
-    # heartbeat
-    heartbeat_seconds: int
-    scan_lines_max: int
-
-    # training
-    history_bars_train: int
-    live_bars: int
-    horizon: int
-
-    # model files
-    model_long_path: str
-    model_short_path: str
-
-    # magic/deviation
-    magic: int
-    deviation: int
-
-    # config json
-    config_json_path: str
+def safe_json_read(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # =========================================================
@@ -175,13 +144,13 @@ class Config:
 class Telegram:
     def __init__(self, token: str, chat_id: str):
         self.token = (token or "").strip()
-        self.chat_id = (str(chat_id) if chat_id is not None else "").strip()
+        self.chat_id = str(chat_id or "").strip()
 
     @property
-    def enabled(self):
+    def enabled(self) -> bool:
         return bool(self.token) and bool(self.chat_id)
 
-    def send(self, msg: str):
+    def send(self, msg: str) -> bool:
         msg = str(msg)
         if not self.enabled:
             print("[TG DISABLED]", msg)
@@ -217,7 +186,7 @@ def account_info_or_die():
         raise RuntimeError("MT5 account_info unavailable. Is MT5 logged in?")
     return acc
 
-def marketwatch_symbols():
+def marketwatch_symbols() -> List[str]:
     syms = mt5.symbols_get()
     if not syms:
         return []
@@ -257,27 +226,13 @@ def positions_by_magic(magic: int):
         return []
     return [p for p in pos if getattr(p, "magic", None) == magic]
 
-def positions_by_magic_and_symbol(magic: int, symbol: str):
-    return [p for p in positions_by_magic(magic) if p.symbol == symbol]
+def positions_for_symbol(symbol: str, magic: int):
+    pos = mt5.positions_get(symbol=symbol)
+    if pos is None:
+        return []
+    return [p for p in pos if getattr(p, "magic", None) == magic]
 
-def position_side(pos) -> str:
-    return "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
-
-def avg_entry_price(positions) -> float:
-    if not positions:
-        return 0.0
-    vol = sum(float(p.volume) for p in positions)
-    if vol <= 0:
-        return 0.0
-    return sum(float(p.price_open) * float(p.volume) for p in positions) / vol
-
-def current_price_for_side(symbol: str, side: str) -> float:
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return 0.0
-    return float(tick.bid) if side == "BUY" else float(tick.ask)  # for PnL check, use exit-side price
-
-def build_sl_tp_from_atr(symbol: str, direction: str, atr_val: float, sl_atr: float, tp_atr: float):
+def build_sl_tp(symbol: str, direction: str, atr_val: float, sl_atr: float, tp_atr: float):
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         raise RuntimeError("No tick")
@@ -293,13 +248,13 @@ def build_sl_tp_from_atr(symbol: str, direction: str, atr_val: float, sl_atr: fl
         sl_dist = sl - entry
     return float(entry), float(sl), float(tp), float(sl_dist)
 
-def calc_lot_size(symbol: str, sl_price_distance: float, risk_fraction: float) -> float:
+def calc_lot_size(symbol: str, sl_price_distance: float, risk_per_trade: float) -> float:
     acc = mt5.account_info()
     info = mt5.symbol_info(symbol)
     if acc is None or info is None:
         return 0.01
 
-    risk_amount = float(acc.balance) * float(risk_fraction)
+    risk_amount = float(acc.balance) * float(risk_per_trade)
 
     tick_value = float(getattr(info, "trade_tick_value", 0.0))
     tick_size = float(getattr(info, "trade_tick_size", 0.0))
@@ -387,34 +342,142 @@ def close_position(pos, magic: int, deviation: int):
         raise RuntimeError(f"Close failed ret={result.retcode} comment={result.comment}")
     return result
 
-def close_all_positions_for_symbol(symbol: str, magic: int, deviation: int):
-    ps = positions_by_magic_and_symbol(magic, symbol)
-    for p in ps:
-        close_position(p, magic, deviation)
+def modify_position_sl_tp(pos, sl: float, tp: float, deviation: int, magic: int):
+    # TRADE_ACTION_SLTP modifies SL/TP for existing position
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": pos.symbol,
+        "position": pos.ticket,
+        "sl": float(sl),
+        "tp": float(tp),
+        "deviation": int(deviation),
+        "magic": int(magic),
+        "comment": "MLbot sync",
+    }
+    result = mt5.order_send(request)
+    return result
 
 
 # =========================================================
-# Gold vs FX helpers (Gates + Confidence scaling)
+# Config
 # =========================================================
 
-def is_gold_symbol(symbol: str) -> bool:
-    s = symbol.upper()
-    return s.startswith("XAU") or s == "XAUUSD" or s == "XAUUSDm"
+@dataclass
+class GateConfig:
+    max_spread_points: int
+    min_atr_points: float
+    enter_th: float
+    reverse_th: float
+    reverse_margin: float
+    # confidence scaling weights (simple + controllable)
+    use_conf_scaling: bool = True
+    spread_penalty_k: float = 0.10     # bigger = more penalty as spread approaches max
+    atr_bonus_k: float = 0.05          # bigger = more bonus when ATR is comfortably above min
+    conf_floor: float = 0.50           # don’t scale below this unless raw is below it
 
-def max_spread_for_symbol(symbol: str, cfg: Config) -> int:
-    return cfg.gold_max_spread_points if is_gold_symbol(symbol) else cfg.fx_max_spread_points
+@dataclass
+class SessionConfig:
+    use_session_filter: bool
+    session_start_hour: int
+    session_end_hour: int
+    # session aggressiveness (UTC)
+    use_session_aggression: bool
+    london_start_utc: int
+    london_end_utc: int
+    ny_start_utc: int
+    ny_end_utc: int
+    london_add_delta_mult: float
+    ny_add_delta_mult: float
+    stop_pyramiding_in_ny: bool
 
-def min_atr_for_symbol(symbol: str, cfg: Config) -> float:
-    return cfg.gold_min_atr_points if is_gold_symbol(symbol) else cfg.fx_min_atr_points
+@dataclass
+class PyramidingConfig:
+    enabled: bool
+    gold_only: bool
+    max_adds_per_symbol: int
+    add_cooldown_seconds: int
+    min_move_atr_to_add: float          # must be at least this many ATRs in profit before adding
+    ladder_mode: str                    # conservative/aggressive/custom
+    ladder_base_delta: float            # how much higher than entry threshold the first add needs
+    ladder_step_delta: float            # additional delta per add
+    add_lot_schedule: List[float]       # multipliers vs base lot [1.0, 0.7, 0.5, ...]
+    # safety:
+    auto_disable_after_loss_streak: bool
+    loss_streak_n: int
+    disable_minutes: int
+    dynamic_cap_by_drawdown: bool
+    dd_soft: float                      # e.g., 0.02 = 2%
+    dd_hard: float                      # e.g., 0.05 = 5%
+    allow_reverse_while_pyramiding: bool
+    basket_sync_sl_tp: bool             # sync SL/TP across symbol after each add (basket logic)
 
-def enter_th_for_symbol(symbol: str, cfg: Config) -> float:
-    return cfg.gold_enter_th if is_gold_symbol(symbol) else cfg.fx_enter_th
+@dataclass
+class NewsConfig:
+    use_news_blackout: bool
+    blackout_minutes_before: int
+    blackout_minutes_after: int
+    events_file: str  # json list of UTC times
 
-def reverse_th_for_symbol(symbol: str, cfg: Config) -> float:
-    return cfg.gold_reverse_th if is_gold_symbol(symbol) else cfg.fx_reverse_th
+@dataclass
+class Config:
+    # Telegram + mode
+    tg_token: str
+    tg_chat_id: str
+    live_trading: bool
+    chatty: bool
 
-def reverse_margin_for_symbol(symbol: str, cfg: Config) -> float:
-    return cfg.gold_reverse_margin if is_gold_symbol(symbol) else cfg.fx_reverse_margin
+    # symbols & timeframes
+    use_marketwatch: bool
+    symbols_csv: str
+    entry_tf: str
+    bias_tf: str
+    gold_entry_tf_override: str  # optional override
+    use_gold_tf_override: bool
+
+    # risk & trade rules
+    risk_per_trade: float
+    max_trades_per_day: int
+    cooldown_seconds: int
+    min_bars_before_reversal: int
+    one_symbol_focus: bool                 # if True, only trades one symbol at a time (global focus)
+
+    # SL/TP ATR
+    sl_atr: float
+    tp_atr: float
+
+    # structure params
+    ema_fast: int
+    ema_slow: int
+    swing_lookback: int
+    level_atr_dist: float
+    wick_pct: float
+    body_max_pct: float
+
+    # gates
+    gate_fx: GateConfig
+    gate_gold: GateConfig
+
+    # sessions + pyramiding + news
+    session: SessionConfig
+    pyramiding: PyramidingConfig
+    news: NewsConfig
+
+    # heartbeat
+    heartbeat_seconds: int
+    scan_lines_max: int
+
+    # training
+    history_bars_train: int
+    live_bars: int
+    horizon: int
+
+    # model files
+    model_long_path: str
+    model_short_path: str
+
+    # magic/deviation
+    magic: int
+    deviation: int
 
 
 # =========================================================
@@ -459,9 +522,9 @@ def add_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
     lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
     df["range"] = rng
-    df["body_pct"] = body / rng
-    df["upper_wick_pct"] = upper_wick / rng
-    df["lower_wick_pct"] = lower_wick / rng
+    df["body_pct"] = (body / rng).fillna(0)
+    df["upper_wick_pct"] = (upper_wick / rng).fillna(0)
+    df["lower_wick_pct"] = (lower_wick / rng).fillna(0)
     return df
 
 def add_structure(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -522,7 +585,7 @@ def bias_from_tf(df_bias: pd.DataFrame) -> str:
         return "SELL"
     return "NONE"
 
-def detect_wick_setups(df: pd.DataFrame, cfg: Config):
+def detect_wick_setups(df: pd.DataFrame, cfg: Config) -> Tuple[bool, bool]:
     """
     Uses last two CLOSED candles:
       c = signal candle (-2), n = confirm candle (-1)
@@ -552,7 +615,7 @@ def detect_wick_setups(df: pd.DataFrame, cfg: Config):
 
     return bool(setup_A), bool(setup_B)
 
-def reversal_signals(df_entry: pd.DataFrame, cfg: Config):
+def reversal_signals(df_entry: pd.DataFrame, cfg: Config) -> dict:
     """
     Uses last TWO closed candles:
       signal candle = -2
@@ -589,7 +652,7 @@ FEATURE_COLS = [
 
 def build_feature_row(df_entry: pd.DataFrame) -> np.ndarray:
     # Use signal candle (-2)
-    return df_entry.iloc[-2][FEATURE_COLS].values.astype(float).reshape(1, -1)
+    return df_entry.iloc[-2][FEATURE_COLS].astype(float).to_numpy().reshape(1, -1)
 
 def label_outcome(df: pd.DataFrame, i: int, side: str, sl_atr: float, tp_atr: float, horizon: int) -> int:
     """
@@ -641,6 +704,7 @@ def train_models_if_needed(symbols, cfg: Config, tg: Telegram, set_status):
     X_long, y_long = [], []
     X_short, y_short = [], []
 
+    # limit training set if too many MarketWatch symbols
     train_syms = symbols[:min(len(symbols), 12)]
 
     for sym in train_syms:
@@ -654,7 +718,7 @@ def train_models_if_needed(symbols, cfg: Config, tg: Telegram, set_status):
             for i in range(cfg.swing_lookback + 10, len(df) - (cfg.horizon + 5)):
                 window = df.iloc[:i+1].copy()
                 sigs = reversal_signals(window, cfg)
-                feats = window.iloc[-2][FEATURE_COLS].values.astype(float)
+                feats = window.iloc[-2][FEATURE_COLS].astype(float).to_numpy()
 
                 if sigs["bull_reversal"] or sigs["setupA_long"]:
                     y = label_outcome(df, i-1, "LONG", cfg.sl_atr, cfg.tp_atr, cfg.horizon)
@@ -702,162 +766,235 @@ def train_models_if_needed(symbols, cfg: Config, tg: Telegram, set_status):
 
 
 # =========================================================
-# Decision logic (scan + reverse + scale-in)
+# Session + News blackout
 # =========================================================
 
 def in_allowed_session_local(cfg: Config) -> bool:
-    if not cfg.use_session_filter:
+    if not cfg.session.use_session_filter:
         return True
     h = datetime.now().hour
-    return cfg.session_start_hour <= h <= cfg.session_end_hour
+    return cfg.session.session_start_hour <= h <= cfg.session.session_end_hour
 
-def decide_reverse(symbol: str, pos_side: str, sigs: dict, p_long: float, p_short: float, cfg: Config):
-    rev_th = reverse_th_for_symbol(symbol, cfg)
-    rev_margin = reverse_margin_for_symbol(symbol, cfg)
+def current_session_utc(cfg: Config) -> str:
+    if not cfg.session.use_session_aggression:
+        return "NONE"
+    h = now_utc().hour
+    if cfg.session.london_start_utc <= h <= cfg.session.london_end_utc:
+        return "LONDON"
+    if cfg.session.ny_start_utc <= h <= cfg.session.ny_end_utc:
+        return "NY"
+    return "OFF"
 
+def load_news_events(cfg: Config) -> List[datetime]:
+    if not cfg.news.use_news_blackout:
+        return []
+    path = cfg.news.events_file.strip()
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        raw = safe_json_read(path)
+        # expected: [{"time_utc": "2026-01-18 13:30"}, ...]
+        events = []
+        for item in raw:
+            t = item.get("time_utc", "")
+            dt = datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            events.append(dt)
+        return events
+    except:
+        return []
+
+def in_news_blackout(cfg: Config, events_utc: List[datetime]) -> Optional[str]:
+    if not cfg.news.use_news_blackout or not events_utc:
+        return None
+    now = now_utc()
+    b = timedelta(minutes=cfg.news.blackout_minutes_before)
+    a = timedelta(minutes=cfg.news.blackout_minutes_after)
+    for ev in events_utc:
+        if (ev - b) <= now <= (ev + a):
+            return f"News blackout window around {fmt_dt(ev)}"
+    return None
+
+
+# =========================================================
+# Gates + confidence scaling
+# =========================================================
+
+def gate_for_symbol(cfg: Config, symbol: str) -> GateConfig:
+    return cfg.gate_gold if is_gold_symbol(symbol) else cfg.gate_fx
+
+def adjust_confidence(p_raw: float, spread: int, atr_pts: float, gate: GateConfig) -> float:
+    if not gate.use_conf_scaling:
+        return float(p_raw)
+
+    # Spread quality: 0.0 (perfect) to ~1.0 (at max)
+    q_spread = clamp(spread / max(1.0, float(gate.max_spread_points)), 0.0, 2.0)
+    # ATR quality: <1.0 means below min ATR; >1 means above
+    q_atr = atr_pts / max(1e-9, float(gate.min_atr_points))
+
+    penalty = max(0.0, q_spread - 0.60) * gate.spread_penalty_k
+    bonus = max(0.0, q_atr - 1.00) * gate.atr_bonus_k
+
+    p = float(p_raw) - penalty + bonus
+    p = clamp(p, gate.conf_floor if p_raw >= gate.conf_floor else 0.0, 0.99)
+    return float(p)
+
+
+# =========================================================
+# Decision logic (entry/reverse/pyramiding)
+# =========================================================
+
+def decide_reverse(pos_side: str, sigs: dict, p_long: float, p_short: float, gate: GateConfig):
     if pos_side == "BUY":
         bearish_setup = sigs["bear_reversal"] or sigs["setupB_short"]
-        if bearish_setup and p_short >= rev_th and (p_short - p_long) >= rev_margin:
+        if bearish_setup and p_short >= gate.reverse_th and (p_short - p_long) >= gate.reverse_margin:
             return "CLOSE_AND_OPEN_SELL"
     else:
         bullish_setup = sigs["bull_reversal"] or sigs["setupA_long"]
-        if bullish_setup and p_long >= rev_th and (p_long - p_short) >= rev_margin:
+        if bullish_setup and p_long >= gate.reverse_th and (p_long - p_short) >= gate.reverse_margin:
             return "CLOSE_AND_OPEN_BUY"
     return "HOLD"
 
-def parse_risk_factors(cfg: Config):
-    parts = [p.strip() for p in (cfg.scale_in_risk_factors_csv or "").split(",") if p.strip()]
-    vals = []
-    for p in parts:
-        try:
-            vals.append(float(p))
-        except:
-            pass
-    if not vals:
-        vals = [1.0, 0.5, 0.3]
-    # ensure base exists
-    if len(vals) < 1:
-        vals = [1.0]
-    return vals
+def ladder_required_threshold(cfg: Config, symbol: str, add_index: int) -> float:
+    """
+    add_index: 1 for first add, 2 for second, etc.
+    required = enter_th + base_delta + (add_index-1)*step_delta
+    plus session multiplier (London/NY).
+    """
+    gate = gate_for_symbol(cfg, symbol)
+    base = gate.enter_th
+    pyr = cfg.pyramiding
 
-def effective_risk_for_leg(cfg: Config, leg_index: int, factors):
-    # leg_index: 0=base, 1=first add, ...
-    f = factors[min(leg_index, len(factors)-1)]
-    return float(cfg.risk_per_trade) * float(f)
+    base_delta = pyr.ladder_base_delta
+    step_delta = pyr.ladder_step_delta
 
-def total_risk_used_for_symbol(cfg: Config, symbol: str, magic: int, factors):
-    # approximate: each open position counts as one leg risk factor (order of opens unknown on restart)
-    ps = positions_by_magic_and_symbol(magic, symbol)
-    used = 0.0
-    for i, _ in enumerate(ps):
-        used += effective_risk_for_leg(cfg, i, factors)
-    return used
+    # mode presets (only if user picks those)
+    if pyr.ladder_mode.lower() == "conservative":
+        base_delta = max(base_delta, 0.05)
+        step_delta = max(step_delta, 0.03)
+    elif pyr.ladder_mode.lower() == "aggressive":
+        base_delta = min(base_delta, 0.03)
+        step_delta = min(step_delta, 0.02)
 
-def can_scale_in(symbol: str, side: str, cfg: Config, df_entry: pd.DataFrame, p_long: float, p_short: float,
-                 last_add_time_by_symbol: dict, factors):
-    if not cfg.scale_in_enabled:
-        return (False, "scale_in disabled")
+    req = base + base_delta + (max(0, add_index - 1) * step_delta)
 
-    if not cfg.allow_multiple_positions_per_symbol:
-        return (False, "multiple positions disabled")
+    sess = current_session_utc(cfg)
+    if cfg.session.use_session_aggression:
+        if sess == "LONDON":
+            req = base + (req - base) * cfg.session.london_add_delta_mult
+        elif sess == "NY":
+            req = base + (req - base) * cfg.session.ny_add_delta_mult
 
-    ps = positions_by_magic_and_symbol(cfg.magic, symbol)
-    if not ps:
-        return (False, "no open position")
+    return float(clamp(req, 0.50, 0.95))
 
-    # only scale into same direction
-    cur_side = position_side(ps[0])
-    if cur_side != side:
-        return (False, "side mismatch")
+def avg_entry_and_volume(positions) -> Tuple[float, float]:
+    tv = 0.0
+    te = 0.0
+    for p in positions:
+        tv += float(p.volume)
+        te += float(p.price_open) * float(p.volume)
+    if tv <= 0:
+        return 0.0, 0.0
+    return te / tv, tv
 
-    if len(ps) >= cfg.max_positions_per_symbol:
-        return (False, f"max positions reached ({len(ps)}/{cfg.max_positions_per_symbol})")
+def sync_basket_sl_tp(cfg: Config, symbol: str, direction: str, atr_val: float, tg: Telegram) -> None:
+    """
+    Basket SL/TP sync across positions for this symbol.
+    Never widens SL (risk). If SL would widen, keep current SL.
+    """
+    if not cfg.pyramiding.basket_sync_sl_tp:
+        return
 
-    # spacing between adds
-    last_add = last_add_time_by_symbol.get(symbol, 0)
-    if time.time() - last_add < cfg.scale_in_min_seconds_between_adds:
-        return (False, "add cooldown")
+    pos = positions_for_symbol(symbol, cfg.magic)
+    if not pos:
+        return
 
-    # gates still apply
-    spr = get_spread_points(symbol)
-    if spr > max_spread_for_symbol(symbol, cfg):
-        return (False, f"spread too high for add ({spr})")
+    avg_entry, tot_vol = avg_entry_and_volume(pos)
+    if avg_entry <= 0 or tot_vol <= 0:
+        return
 
-    atr_val = float(df_entry.iloc[-1]["atr_14"])
-    atr_pts = atr_to_points(symbol, atr_val)
-    if atr_pts < min_atr_for_symbol(symbol, cfg):
-        return (False, f"atr too low for add ({atr_pts:.1f})")
-
-    # only add if price is in profit by >= X * ATR
-    avg_entry = avg_entry_price(ps)
-    px = current_price_for_side(symbol, cur_side)
-    # For BUY: profit if px > avg_entry; for SELL: profit if px < avg_entry
-    if atr_val <= 0:
-        return (False, "atr invalid")
-
-    if cur_side == "BUY":
-        profit_dist = px - avg_entry
-        required = cfg.scale_in_min_profit_atr * atr_val
-        if profit_dist < required:
-            return (False, f"not enough profit to add ({profit_dist:.5f}<{required:.5f})")
+    if direction == "BUY":
+        new_sl = avg_entry - cfg.sl_atr * atr_val
+        new_tp = avg_entry + cfg.tp_atr * atr_val
+        # never widen: SL must be >= current SL
+        for p in pos:
+            cur_sl = float(p.sl) if float(p.sl) > 0 else None
+            if cur_sl is not None and new_sl < cur_sl:
+                new_sl = cur_sl
     else:
-        profit_dist = avg_entry - px
-        required = cfg.scale_in_min_profit_atr * atr_val
-        if profit_dist < required:
-            return (False, f"not enough profit to add ({profit_dist:.5f}<{required:.5f})")
+        new_sl = avg_entry + cfg.sl_atr * atr_val
+        new_tp = avg_entry - cfg.tp_atr * atr_val
+        # never widen: for sells SL must be <= current SL
+        for p in pos:
+            cur_sl = float(p.sl) if float(p.sl) > 0 else None
+            if cur_sl is not None and new_sl > cur_sl:
+                new_sl = cur_sl
 
-    # confidence bump for adds
-    enter_th = enter_th_for_symbol(symbol, cfg)
-    bump = float(cfg.scale_in_confidence_bump)
-    if cur_side == "BUY":
-        if p_long < (enter_th + bump):
-            return (False, f"p_long below add threshold ({p_long:.3f}<{enter_th+bump:.3f})")
-    else:
-        if p_short < (enter_th + bump):
-            return (False, f"p_short below add threshold ({p_short:.3f}<{enter_th+bump:.3f})")
+    for p in pos:
+        modify_position_sl_tp(p, new_sl, new_tp, cfg.deviation, cfg.magic)
 
-    # risk cap per symbol
-    used = total_risk_used_for_symbol(cfg, symbol, cfg.magic, factors)
-    next_leg_idx = len(ps)  # next leg index = existing count
-    next_risk = effective_risk_for_leg(cfg, next_leg_idx, factors)
-    if used + next_risk > cfg.max_total_risk_per_symbol:
-        return (False, f"risk cap reached ({used+next_risk:.4f}>{cfg.max_total_risk_per_symbol:.4f})")
+    tg.send(
+        f"🧺 Basket SL/TP synced ({symbol})\n"
+        f"Dir={direction} avg_entry={avg_entry:.5f} vol={tot_vol}\n"
+        f"SL={new_sl:.5f} TP={new_tp:.5f}"
+    )
 
-    return (True, "ok")
+def can_add_pyramiding(cfg: Config, symbol: str) -> Tuple[bool, str]:
+    pyr = cfg.pyramiding
+    if not pyr.enabled:
+        return False, "Pyramiding disabled"
+    if pyr.gold_only and not is_gold_symbol(symbol):
+        return False, "Pyramiding set to GOLD-only"
+    sess = current_session_utc(cfg)
+    if cfg.session.use_session_aggression and sess == "NY" and cfg.session.stop_pyramiding_in_ny:
+        return False, "NY session: pyramiding disabled"
+    return True, "OK"
 
-def score_symbol(sym: str, cfg: Config, model_long, model_short):
-    # Spread gate
+
+# =========================================================
+# Scoring
+# =========================================================
+
+def entry_timeframe(cfg: Config, symbol: str) -> str:
+    if cfg.use_gold_tf_override and is_gold_symbol(symbol):
+        return cfg.gold_entry_tf_override
+    return cfg.entry_tf
+
+def score_symbol(sym: str, cfg: Config, model_long, model_short, events_utc: List[datetime]):
+    gate = gate_for_symbol(cfg, sym)
+
+    # news blackout (optional)
+    nb = in_news_blackout(cfg, events_utc)
+    if nb:
+        return {"symbol": sym, "ok": False, "reason": nb}
+
     spread = get_spread_points(sym)
-    max_spread = max_spread_for_symbol(sym, cfg)
-    if spread > max_spread:
-        return {"symbol": sym, "ok": False, "reason": f"Spread too high ({spread}>{max_spread})"}
+    if spread > gate.max_spread_points:
+        return {"symbol": sym, "ok": False, "reason": f"Spread too high ({spread}>{gate.max_spread_points})"}
 
-    df_entry = build_frame(sym, cfg.entry_tf, cfg.live_bars, cfg)
+    tf_entry = entry_timeframe(cfg, sym)
+    df_entry = build_frame(sym, tf_entry, cfg.live_bars, cfg)
     df_bias = build_frame(sym, cfg.bias_tf, cfg.live_bars, cfg)
 
     bias = bias_from_tf(df_bias)
     sigs = reversal_signals(df_entry, cfg)
 
-    # ATR gate
     atr_val = float(df_entry.iloc[-1]["atr_14"])
-    ap = atr_to_points(sym, atr_val)
-    min_atr = min_atr_for_symbol(sym, cfg)
-    if ap < min_atr:
-        return {"symbol": sym, "ok": False, "reason": f"ATR too low ({ap:.1f}<{min_atr} pts)"}
+    atr_pts = atr_to_points(sym, atr_val)
+    if atr_pts < gate.min_atr_points:
+        return {"symbol": sym, "ok": False, "reason": f"ATR too low ({atr_pts:.1f}<{gate.min_atr_points} pts)"}
 
-    # ML probabilities
     x = build_feature_row(df_entry)
-    p_long = float(model_long.predict_proba(x)[0, 1])
-    p_short = float(model_short.predict_proba(x)[0, 1])
+    p_long_raw = float(model_long.predict_proba(x)[0, 1])
+    p_short_raw = float(model_short.predict_proba(x)[0, 1])
 
-    # confidence scaling
-    enter_th = enter_th_for_symbol(sym, cfg)
+    p_long = adjust_confidence(p_long_raw, spread, atr_pts, gate)
+    p_short = adjust_confidence(p_short_raw, spread, atr_pts, gate)
 
     long_setup = sigs["bull_reversal"] or sigs["setupA_long"]
     short_setup = sigs["bear_reversal"] or sigs["setupB_short"]
 
-    long_ready = long_setup and (p_long >= enter_th) and (bias in ["NONE", "BUY"])
-    short_ready = short_setup and (p_short >= enter_th) and (bias in ["NONE", "SELL"])
+    long_ready = long_setup and (p_long >= gate.enter_th) and (bias in ["NONE", "BUY"])
+    short_ready = short_setup and (p_short >= gate.enter_th) and (bias in ["NONE", "SELL"])
 
     options = []
     if long_ready:
@@ -874,63 +1011,78 @@ def score_symbol(sym: str, cfg: Config, model_long, model_short):
     return {
         "symbol": sym, "ok": True,
         "spread": spread, "bias": bias,
-        "atr_pts": ap, "atr_val": atr_val,
+        "atr_pts": atr_pts, "atr_val": atr_val,
         "p_long": p_long, "p_short": p_short,
+        "p_long_raw": p_long_raw, "p_short_raw": p_short_raw,
         "signals": sigs, "best": best,
         "df_entry": df_entry,
-        "enter_th_used": enter_th,
-        "max_spread_used": max_spread,
-        "min_atr_used": min_atr
+        "tf_entry": tf_entry,
+        "gate": gate
     }
 
 
 # =========================================================
-# JSON config helpers
+# Config load/save + guide
 # =========================================================
 
-def load_config_json(path: str):
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_config_json(path: str, cfg: Config):
-    data = asdict(cfg)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+def cfg_to_dict(cfg: Config) -> dict:
+    d = asdict(cfg)
+    return d
 
 def cfg_from_dict(d: dict) -> Config:
-    # allow missing keys by providing safe defaults
-    base = interactive_setup(use_json=False)  # build default baseline quickly
-    base_dict = asdict(base)
-    base_dict.update(d or {})
-    return Config(**base_dict)
+    # nested dataclasses
+    d = dict(d)
+    d["gate_fx"] = GateConfig(**d["gate_fx"])
+    d["gate_gold"] = GateConfig(**d["gate_gold"])
+    d["session"] = SessionConfig(**d["session"])
+    d["pyramiding"] = PyramidingConfig(**d["pyramiding"])
+    d["news"] = NewsConfig(**d["news"])
+    return Config(**d)
+
+def write_behavior_guide(cfg: Config, symbols: List[str]) -> None:
+    lines = []
+    lines.append("MT5 BOT v1 — Behavior Guide")
+    lines.append("")
+    lines.append("1) Entry gating:")
+    lines.append("- Trades ONLY when reversal/wick setup triggers AND ML confidence passes threshold.")
+    lines.append("- FX and GOLD use different gates (spread/ATR/threshold).")
+    lines.append("")
+    lines.append("2) SL/TP:")
+    lines.append("- Always ATR-based SL/TP (set automatically).")
+    lines.append("- If pyramiding enabled, basket sync may adjust TP (and SL without widening risk).")
+    lines.append("")
+    lines.append("3) Pyramiding (adds):")
+    lines.append("- Adds only when trade is in profit by a minimum ATR move.")
+    lines.append("- Each add requires a higher confidence threshold (ladder).")
+    lines.append("- Can be disabled by NY session, loss streak, or drawdown cap.")
+    lines.append("")
+    lines.append("4) Safety:")
+    lines.append("- Max trades/day, cooldown, session filter, spread/ATR filters.")
+    lines.append("")
+    lines.append(f"Symbols: {', '.join(symbols[:30])}{'...' if len(symbols)>30 else ''}")
+    lines.append("")
+    lines.append("NOTE: No live news scraping by default. Optional manual news blackout via news_events.json.")
+
+    with open("bot_behavior_guide.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # =========================================================
 # Interactive setup
 # =========================================================
 
-def interactive_setup(use_json=True) -> Config:
-    print("\n=== MT5 ML BOT SETUP ===\n")
+def interactive_setup() -> Config:
+    print("\n=== MT5 ML BOT SETUP (v1) ===\n")
 
-    # JSON load
-    config_path = "bot_config.json"
-    if use_json and os.path.exists(config_path):
-        if prompt_yesno(f"Config file found ({config_path}). Load it?", "yes"):
-            try:
-                d = load_config_json(config_path)
-                cfg = cfg_from_dict(d)
-                cfg.config_json_path = config_path
-                print("✅ Loaded config from JSON.")
-                # You can still override a few key items quickly:
-                if prompt_yesno("Override LIVE trading / timeframes quickly?", "no"):
-                    cfg.live_trading = prompt_yesno("Enable LIVE trading? (no = alerts only)", "no")
-                    cfg.entry_tf = prompt_str("Entry timeframe (M1/M5/M15/M30/H1)", cfg.entry_tf).upper()
-                    cfg.bias_tf = prompt_str("Bias timeframe (M5/M15/M30/H1)", cfg.bias_tf).upper()
-                return cfg
-            except Exception as e:
-                print("⚠️ Failed to load JSON, switching to manual setup:", e)
+    use_json = prompt_yesno("Load settings from JSON config file?", "no")
+    if use_json:
+        path = prompt_str("Config JSON path", "bot_config.json")
+        if os.path.exists(path):
+            d = safe_json_read(path)
+            cfg = cfg_from_dict(d)
+            print(f"✅ Loaded config: {path}")
+            return cfg
+        print("⚠️ Config file not found, switching to interactive setup.\n")
 
     # Telegram
     tg_token = prompt_str("Telegram bot token (empty disables Telegram)", "")
@@ -939,69 +1091,109 @@ def interactive_setup(use_json=True) -> Config:
     live_trading = prompt_yesno("Enable LIVE trading? (no = alerts only)", "no")
     chatty = prompt_yesno("Chatty mode? (more updates / reasons)", "yes")
 
+    # Symbols
     use_mw = prompt_yesno("Use symbols from MT5 Market Watch automatically?", "yes")
     symbols_csv = ""
     if not use_mw:
         symbols_csv = prompt_str("Symbols CSV (example: XAUUSD,EURUSD,USDJPY)", "EURUSD,GBPUSD,USDJPY,AUDUSD,XAUUSD")
 
+    # TF
     entry_tf = prompt_str("Entry timeframe (M1/M5/M15/M30/H1)", "M5").upper()
     bias_tf = prompt_str("Bias timeframe (M5/M15/M30/H1)", "M15").upper()
     if entry_tf not in TF_MAP or bias_tf not in TF_MAP:
         raise RuntimeError("Unsupported timeframe. Use: " + ", ".join(TF_MAP.keys()))
 
+    use_gold_tf_override = prompt_yesno("Use GOLD entry timeframe override?", "no")
+    gold_entry_tf_override = entry_tf
+    if use_gold_tf_override:
+        gold_entry_tf_override = prompt_str("GOLD entry timeframe override (M1/M5/M15/M30/H1)", "M5").upper()
+        if gold_entry_tf_override not in TF_MAP:
+            raise RuntimeError("Unsupported GOLD timeframe.")
+
     # Risk
-    risk = prompt_float("Risk per BASE trade (0.005 = 0.5%)", 0.005)
-    max_day = prompt_int("Max trades per day", 3)
+    risk = prompt_float("Risk per trade (0.005 = 0.5%)", 0.005)
+    max_day = prompt_int("Max trades per day", 2)
     cooldown = prompt_int("Cooldown seconds between actions", 90)
     min_bars_rev = prompt_int("Min bars before reversal (anti-chop)", 3)
-
-    # Session
-    use_session = prompt_yesno("Use session filter (trade only certain hours)?", "yes")
-    start_h = prompt_int("Session start hour (local time, 0-23)", 7)
-    end_h = prompt_int("Session end hour (local time, 0-23)", 23)
-
-    # Portfolio behavior
-    one_symbol = prompt_yesno("One symbol at a time? (prevents multi-pair exposure)", "yes")
-    allow_multi_pos_symbol = prompt_yesno("Allow multiple positions per symbol (controlled pyramiding)?", "yes")
-
-    # Gates
-    print("\n=== Per-Asset Filters (Gold vs FX) ===")
-    fx_max_spread = prompt_int("FX Max spread (points)", 20)
-    gold_max_spread = prompt_int("GOLD Max spread (points) (XAU)", 100)
-
-    fx_min_atr_pts = prompt_float("FX Min ATR (points)", 15)
-    gold_min_atr_pts = prompt_float("GOLD Min ATR (points) (XAU)", 25)
+    one_symbol_focus = prompt_yesno("One-symbol focus? (manage only one symbol at a time)", "yes")
 
     # SL/TP
     sl_atr = prompt_float("StopLoss ATR multiple", 1.2)
     tp_atr = prompt_float("TakeProfit ATR multiple", 1.8)
 
-    # Confidence scaling
-    print("\n=== Confidence Scaling (Gold vs FX) ===")
-    fx_enter_th = prompt_float("FX Enter probability threshold", 0.61)
-    gold_enter_th = prompt_float("GOLD Enter probability threshold (XAU)", 0.58)
+    # Session filter
+    use_session = prompt_yesno("Use session filter (trade only certain hours, LOCAL time)?", "yes")
+    start_h = prompt_int("Session start hour (local time, 0-23)", 7)
+    end_h = prompt_int("Session end hour (local time, 0-23)", 20)
 
-    fx_reverse_th = prompt_float("FX Reverse probability threshold", 0.66)
-    gold_reverse_th = prompt_float("GOLD Reverse probability threshold (XAU)", 0.62)
+    # Session aggression
+    use_sess_aggr = prompt_yesno("Use session-specific aggressiveness (London vs NY)?", "yes")
+    london_add_mult = prompt_float("London add threshold multiplier (1.0 = normal)", 1.0)
+    ny_add_mult = prompt_float("NY add threshold multiplier (>1 = more strict)", 1.15)
+    stop_pyr_ny = prompt_yesno("Auto-stop pyramiding in NY session?", "yes")
 
-    fx_rev_margin = prompt_float("FX Reverse margin", 0.10)
-    gold_rev_margin = prompt_float("GOLD Reverse margin (XAU)", 0.06)
+    # FX Gate
+    print("\n--- FX Gate ---")
+    fx_spread = prompt_int("FX max spread (points)", 20)
+    fx_atr = prompt_float("FX min ATR (points)", 15.0)
+    fx_enter = prompt_float("FX entry threshold", 0.61)
+    fx_rev = prompt_float("FX reverse threshold", 0.68)
+    fx_margin = prompt_float("FX reverse margin", 0.10)
+    fx_conf = prompt_yesno("FX confidence scaling?", "yes")
+
+    # GOLD Gate
+    print("\n--- GOLD Gate ---")
+    gold_spread = prompt_int("GOLD max spread (points)", 100)
+    gold_atr = prompt_float("GOLD min ATR (points)", 25.0)
+    gold_enter = prompt_float("GOLD entry threshold", 0.58)
+    gold_rev = prompt_float("GOLD reverse threshold", 0.66)
+    gold_margin = prompt_float("GOLD reverse margin", 0.08)
+    gold_conf = prompt_yesno("GOLD confidence scaling?", "yes")
 
     # Pyramiding
-    print("\n=== Controlled Pyramiding (Scale-In) ===")
-    scale_in_enabled = prompt_yesno("Enable controlled pyramiding (adds only in profit)?", "yes" if allow_multi_pos_symbol else "no")
-    max_pos = prompt_int("Max positions per symbol (including base)", 3)
-    scale_profit_atr = prompt_float("Min profit before add (ATR multiple)", 0.6)
-    add_gap = prompt_int("Min seconds between adds", 180)
-    conf_bump = prompt_float("Confidence bump required for adds (enter_th + bump)", 0.03)
-    risk_factors = prompt_str("Risk factors CSV (base,add1,add2...) e.g. 1.0,0.5,0.3", "1.0,0.5,0.3")
-    max_risk_sym = prompt_float("Max total risk per symbol (0.01 = 1%)", 0.010)
+    print("\n--- Pyramiding (adds) ---")
+    pyr_enabled = prompt_yesno("Enable pyramiding (adds)?", "no")
+    pyr_gold_only = prompt_yesno("If pyramiding enabled: GOLD-only?", "no")
+    pyr_max_adds = prompt_int("Max adds per symbol (0 disables adds)", 3)
+    pyr_add_cd = prompt_int("Add cooldown seconds", 120)
+    pyr_min_move_atr = prompt_float("Min move (in ATRs) in profit before add", 0.6)
 
-    # Heartbeat
+    ladder_mode = prompt_str("Confidence ladder mode (conservative/aggressive/custom)", "conservative")
+    ladder_base_delta = prompt_float("Ladder base delta (first add needs +delta)", 0.05)
+    ladder_step_delta = prompt_float("Ladder step delta (each add needs +step)", 0.03)
+
+    # lot schedule
+    schedule_raw = prompt_str("Add lot schedule multipliers (comma list)", "1.0,0.7,0.5,0.4,0.3")
+    add_sched = []
+    for x in schedule_raw.split(","):
+        try:
+            add_sched.append(float(x.strip()))
+        except:
+            pass
+    if not add_sched:
+        add_sched = [1.0, 0.7, 0.5, 0.4, 0.3]
+
+    auto_disable = prompt_yesno("Auto-disable pyramiding after loss streak?", "yes")
+    loss_n = prompt_int("Loss streak N to disable adds", 2)
+    disable_mins = prompt_int("Disable pyramiding minutes after streak", 60)
+
+    dyn_cap = prompt_yesno("Dynamic add cap based on drawdown?", "yes")
+    dd_soft = prompt_float("Drawdown soft limit (e.g. 0.02 = 2%)", 0.02)
+    dd_hard = prompt_float("Drawdown hard limit (e.g. 0.05 = 5%)", 0.05)
+
+    allow_rev_pyr = prompt_yesno("Allow reverse while pyramiding?", "no")
+    basket_sync = prompt_yesno("Basket sync SL/TP after adds?", "yes")
+
+    # News blackout
+    print("\n--- News Blackout (optional) ---")
+    use_news_blackout = prompt_yesno("Use manual news blackout windows?", "no")
+    blackout_before = prompt_int("Blackout minutes BEFORE event", 15)
+    blackout_after = prompt_int("Blackout minutes AFTER event", 15)
+    events_file = prompt_str("Events file path (news_events.json)", "news_events.json")
+
+    # Heartbeat & training
     heartbeat = prompt_int("Heartbeat interval seconds", 300)
-    scan_lines_max = prompt_int("Heartbeat scan lines to show", 8)
-
-    # Training
+    scan_lines_max = prompt_int("Heartbeat scan lines to show", 6)
     history_train = prompt_int("Training history bars per symbol", 9000)
     live_bars = prompt_int("Live bars to fetch per symbol", 700)
     horizon = prompt_int("Training horizon (candles forward)", 12)
@@ -1016,6 +1208,7 @@ def interactive_setup(use_json=True) -> Config:
 
     model_long_path = "model_long.pkl"
     model_short_path = "model_short.pkl"
+
     magic = 20260116
     deviation = 20
 
@@ -1029,23 +1222,14 @@ def interactive_setup(use_json=True) -> Config:
         symbols_csv=symbols_csv,
         entry_tf=entry_tf,
         bias_tf=bias_tf,
+        gold_entry_tf_override=gold_entry_tf_override,
+        use_gold_tf_override=use_gold_tf_override,
 
         risk_per_trade=risk,
         max_trades_per_day=max_day,
         cooldown_seconds=cooldown,
         min_bars_before_reversal=min_bars_rev,
-
-        use_session_filter=use_session,
-        session_start_hour=start_h,
-        session_end_hour=end_h,
-
-        one_symbol_at_a_time=one_symbol,
-        allow_multiple_positions_per_symbol=allow_multi_pos_symbol,
-
-        fx_max_spread_points=fx_max_spread,
-        gold_max_spread_points=gold_max_spread,
-        fx_min_atr_points=fx_min_atr_pts,
-        gold_min_atr_points=gold_min_atr_pts,
+        one_symbol_focus=one_symbol_focus,
 
         sl_atr=sl_atr,
         tp_atr=tp_atr,
@@ -1057,20 +1241,63 @@ def interactive_setup(use_json=True) -> Config:
         wick_pct=wick_pct,
         body_max_pct=body_max_pct,
 
-        fx_enter_th=fx_enter_th,
-        gold_enter_th=gold_enter_th,
-        fx_reverse_th=fx_reverse_th,
-        gold_reverse_th=gold_reverse_th,
-        fx_reverse_margin=fx_rev_margin,
-        gold_reverse_margin=gold_rev_margin,
+        gate_fx=GateConfig(
+            max_spread_points=fx_spread,
+            min_atr_points=fx_atr,
+            enter_th=fx_enter,
+            reverse_th=fx_rev,
+            reverse_margin=fx_margin,
+            use_conf_scaling=fx_conf,
+        ),
+        gate_gold=GateConfig(
+            max_spread_points=gold_spread,
+            min_atr_points=gold_atr,
+            enter_th=gold_enter,
+            reverse_th=gold_rev,
+            reverse_margin=gold_margin,
+            use_conf_scaling=gold_conf,
+        ),
 
-        scale_in_enabled=scale_in_enabled,
-        max_positions_per_symbol=max_pos,
-        scale_in_min_profit_atr=scale_profit_atr,
-        scale_in_min_seconds_between_adds=add_gap,
-        scale_in_confidence_bump=conf_bump,
-        scale_in_risk_factors_csv=risk_factors,
-        max_total_risk_per_symbol=max_risk_sym,
+        session=SessionConfig(
+            use_session_filter=use_session,
+            session_start_hour=start_h,
+            session_end_hour=end_h,
+            use_session_aggression=use_sess_aggr,
+            london_start_utc=7,
+            london_end_utc=16,
+            ny_start_utc=12,
+            ny_end_utc=21,
+            london_add_delta_mult=london_add_mult,
+            ny_add_delta_mult=ny_add_mult,
+            stop_pyramiding_in_ny=stop_pyr_ny,
+        ),
+
+        pyramiding=PyramidingConfig(
+            enabled=pyr_enabled and pyr_max_adds > 0,
+            gold_only=pyr_gold_only,
+            max_adds_per_symbol=max(0, pyr_max_adds),
+            add_cooldown_seconds=pyr_add_cd,
+            min_move_atr_to_add=pyr_min_move_atr,
+            ladder_mode=ladder_mode,
+            ladder_base_delta=ladder_base_delta,
+            ladder_step_delta=ladder_step_delta,
+            add_lot_schedule=add_sched,
+            auto_disable_after_loss_streak=auto_disable,
+            loss_streak_n=max(1, loss_n),
+            disable_minutes=max(1, disable_mins),
+            dynamic_cap_by_drawdown=dyn_cap,
+            dd_soft=max(0.0, dd_soft),
+            dd_hard=max(dd_soft, dd_hard),
+            allow_reverse_while_pyramiding=allow_rev_pyr,
+            basket_sync_sl_tp=basket_sync,
+        ),
+
+        news=NewsConfig(
+            use_news_blackout=use_news_blackout,
+            blackout_minutes_before=blackout_before,
+            blackout_minutes_after=blackout_after,
+            events_file=events_file,
+        ),
 
         heartbeat_seconds=heartbeat,
         scan_lines_max=scan_lines_max,
@@ -1083,37 +1310,74 @@ def interactive_setup(use_json=True) -> Config:
         model_short_path=model_short_path,
 
         magic=magic,
-        deviation=deviation,
-
-        config_json_path=config_path
+        deviation=deviation
     )
 
-    # Save config?
-    if use_json:
-        if prompt_yesno(f"Save these settings to {config_path} for next time?", "yes"):
-            save_config_json(config_path, cfg)
-            print(f"✅ Saved config: {config_path}")
+    save_json = prompt_yesno("Save these settings to JSON for easy reuse?", "yes")
+    if save_json:
+        path = prompt_str("Save path", "bot_config.json")
+        safe_json_write(path, cfg_to_dict(cfg))
+        print(f"✅ Saved config: {path}")
 
     return cfg
 
 
 # =========================================================
-# Main
+# Pyramiding runtime state
+# =========================================================
+
+@dataclass
+class SymbolState:
+    base_lot: float = 0.0
+    adds: int = 0
+    last_add_ts: float = 0.0
+    disabled_until_utc: Optional[datetime] = None
+    loss_streak: int = 0
+
+def effective_max_adds(cfg: Config, acc) -> int:
+    pyr = cfg.pyramiding
+    if not pyr.dynamic_cap_by_drawdown:
+        return pyr.max_adds_per_symbol
+
+    # drawdown based on equity vs peak
+    # (we’ll compute peak in main loop; this helper just clamps)
+    return pyr.max_adds_per_symbol
+
+def drawdown_ratio(peak_equity: float, equity: float) -> float:
+    if peak_equity <= 0:
+        return 0.0
+    return clamp((peak_equity - equity) / peak_equity, 0.0, 1.0)
+
+def dynamic_add_cap(cfg: Config, dd: float) -> int:
+    pyr = cfg.pyramiding
+    if not pyr.dynamic_cap_by_drawdown:
+        return pyr.max_adds_per_symbol
+    if dd >= pyr.dd_hard:
+        return 0
+    if dd <= pyr.dd_soft:
+        return pyr.max_adds_per_symbol
+    # linear reduce between soft and hard
+    t = (dd - pyr.dd_soft) / max(1e-9, (pyr.dd_hard - pyr.dd_soft))
+    cap = int(round((1.0 - t) * pyr.max_adds_per_symbol))
+    return max(0, min(pyr.max_adds_per_symbol, cap))
+
+
+# =========================================================
+# Main loop
 # =========================================================
 
 def main():
-    cfg = interactive_setup(use_json=True)
+    cfg = interactive_setup()
     tg = Telegram(cfg.tg_token, cfg.tg_chat_id)
 
     mt5_init_or_die()
     acc = account_info_or_die()
 
-    # symbols
+    # Symbols
     if cfg.use_marketwatch:
         symbols = marketwatch_symbols()
     else:
-        symbols = [s.strip() for s in (cfg.symbols_csv or "").split(",") if s.strip()]
-        symbols = [s.upper() for s in symbols]
+        symbols = [s.strip().upper() for s in cfg.symbols_csv.split(",") if s.strip()]
 
     if not symbols:
         raise RuntimeError("No symbols available.")
@@ -1130,6 +1394,10 @@ def main():
     if bad_syms:
         tg.send(f"⚠️ Some symbols unavailable: {', '.join(bad_syms)}")
 
+    events_utc = load_news_events(cfg)
+
+    write_behavior_guide(cfg, ok_syms)
+
     tg.send(
         "✅ Bot started\n"
         f"Account: {acc.login} | Server: {acc.server}\n"
@@ -1138,44 +1406,52 @@ def main():
         f"Symbols: {', '.join(ok_syms[:20])}{'...' if len(ok_syms) > 20 else ''}\n"
         f"EntryTF={cfg.entry_tf} BiasTF={cfg.bias_tf}\n"
         f"Chatty={cfg.chatty} Heartbeat={cfg.heartbeat_seconds}s\n"
-        f"FX gate: spr<={cfg.fx_max_spread_points}, ATR>={cfg.fx_min_atr_points}, enter>={cfg.fx_enter_th}\n"
-        f"GOLD gate: spr<={cfg.gold_max_spread_points}, ATR>={cfg.gold_min_atr_points}, enter>={cfg.gold_enter_th}\n"
-        f"Pyramiding: {cfg.scale_in_enabled} maxPos/sym={cfg.max_positions_per_symbol} maxRisk/sym={cfg.max_total_risk_per_symbol}"
+        f"FX gate: spr<={cfg.gate_fx.max_spread_points}, ATR>={cfg.gate_fx.min_atr_points}, enter>={cfg.gate_fx.enter_th}\n"
+        f"GOLD gate: spr<={cfg.gate_gold.max_spread_points}, ATR>={cfg.gate_gold.min_atr_points}, enter>={cfg.gate_gold.enter_th}\n"
+        f"Pyramiding: {cfg.pyramiding.enabled} max_adds={cfg.pyramiding.max_adds_per_symbol} ladder={cfg.pyramiding.ladder_mode}"
     )
 
     last_status = "Initialized. First scan pending..."
     last_scan_summary = ""
     last_heartbeat_time = time.time()
-    last_action_time = 0
 
     def set_status(s: str):
         nonlocal last_status
         last_status = s
 
-    # train/load models
+    # Train/load models
     train_models_if_needed(ok_syms, cfg, tg, set_status)
     model_long = joblib.load(cfg.model_long_path)
     model_short = joblib.load(cfg.model_short_path)
 
     trades_today = 0
     day = now_utc().date()
+    last_action_time = 0.0
 
-    # for min-hold & adds
-    entry_time_by_symbol = {}         # base entry time per symbol (best-effort)
-    last_add_time_by_symbol = {}      # last add time per symbol
+    entry_time_by_symbol: Dict[str, datetime] = {}
+    sym_state: Dict[str, SymbolState] = {s: SymbolState() for s in ok_syms}
 
-    # parse factors once
-    factors = parse_risk_factors(cfg)
+    peak_equity = float(getattr(acc, "equity", acc.balance))
 
     tg.send("🚀 Live loop running.")
 
     while True:
         try:
+            # refresh account for dd cap
+            acc = account_info_or_die()
+            equity = float(getattr(acc, "equity", acc.balance))
+            if equity > peak_equity:
+                peak_equity = equity
+            dd = drawdown_ratio(peak_equity, equity)
+            max_adds_dd = dynamic_add_cap(cfg, dd)
+
             # Heartbeat
             if time.time() - last_heartbeat_time >= cfg.heartbeat_seconds:
                 tg.send(
                     f"💓 Heartbeat\n"
-                    f"UTC: {now_utc():%Y-%m-%d %H:%M:%S}\n"
+                    f"UTC: {fmt_dt(now_utc())}\n"
+                    f"Session: {current_session_utc(cfg)}\n"
+                    f"Equity: {equity:.2f} Peak: {peak_equity:.2f} DD: {dd*100:.1f}% (max_adds_now={max_adds_dd})\n"
                     f"Status: {last_status}\n\n"
                     f"Scan:\n{last_scan_summary}"
                 )
@@ -1184,13 +1460,14 @@ def main():
             # Session filter
             if not in_allowed_session_local(cfg):
                 set_status("Outside session hours (sleeping).")
-                time.sleep(30)
+                time.sleep(20)
                 continue
 
             # Daily reset
             if now_utc().date() != day:
                 day = now_utc().date()
                 trades_today = 0
+                peak_equity = float(getattr(acc, "equity", acc.balance))
                 tg.send("🗓 New day: trades/day counter reset.")
 
             # Cooldown
@@ -1201,79 +1478,90 @@ def main():
             # Max trades/day
             if trades_today >= cfg.max_trades_per_day:
                 set_status(f"Max trades reached ({trades_today}/{cfg.max_trades_per_day}).")
-                time.sleep(15)
+                time.sleep(12)
                 continue
 
-            # ---------------------------
-            # Manage open positions first
-            # ---------------------------
-            all_pos = positions_by_magic(cfg.magic)
-            open_symbols = sorted(list({p.symbol for p in all_pos}))
-
-            if open_symbols and cfg.one_symbol_at_a_time:
-                # only manage the first open symbol (single idea at a time)
-                open_symbols = [open_symbols[0]]
-
-            did_action = False
-
-            for sym in open_symbols:
-                ps = positions_by_magic_and_symbol(cfg.magic, sym)
-                if not ps:
+            # --- Manage existing positions (one-symbol focus = always manage before scanning) ---
+            open_positions = positions_by_magic(cfg.magic)
+            if open_positions and cfg.one_symbol_focus:
+                # choose first symbol
+                sym = open_positions[0].symbol
+                pos_list = positions_for_symbol(sym, cfg.magic)
+                if not pos_list:
+                    time.sleep(3)
                     continue
 
-                # Determine current side (assume all are same side)
-                cur_side = position_side(ps[0])
+                # Determine net direction from first position type
+                pos_side = "BUY" if pos_list[0].type == mt5.POSITION_TYPE_BUY else "SELL"
+                gate = gate_for_symbol(cfg, sym)
 
-                # Build frame and probs for management
-                df_entry = build_frame(sym, cfg.entry_tf, cfg.live_bars, cfg)
+                tf_entry = entry_timeframe(cfg, sym)
+                df_entry = build_frame(sym, tf_entry, cfg.live_bars, cfg)
                 sigs = reversal_signals(df_entry, cfg)
-                x = build_feature_row(df_entry)
-                p_long = float(model_long.predict_proba(x)[0, 1])
-                p_short = float(model_short.predict_proba(x)[0, 1])
+                atr_val = float(df_entry.iloc[-1]["atr_14"])
+                atr_pts = atr_to_points(sym, atr_val)
+                spr = get_spread_points(sym)
 
-                # min-hold bars protection (time approximation)
+                x = build_feature_row(df_entry)
+                pL_raw = float(model_long.predict_proba(x)[0, 1])
+                pS_raw = float(model_short.predict_proba(x)[0, 1])
+                pL = adjust_confidence(pL_raw, spr, atr_pts, gate)
+                pS = adjust_confidence(pS_raw, spr, atr_pts, gate)
+
+                # reversal hold protection
                 can_reverse = True
                 entry_t = entry_time_by_symbol.get(sym)
                 if entry_t is not None:
-                    bar_minutes = 5 if cfg.entry_tf == "M5" else 15 if cfg.entry_tf == "M15" else 1
+                    bar_minutes = {"M1":1,"M5":5,"M15":15,"M30":30,"H1":60}.get(tf_entry, 5)
                     min_hold = timedelta(minutes=bar_minutes * cfg.min_bars_before_reversal)
                     if now_utc() - entry_t < min_hold:
                         can_reverse = False
 
-                # Reversal decision (close all then open opposite)
-                action = decide_reverse(sym, cur_side, sigs, p_long, p_short, cfg)
+                # pyramiding stop rules
+                state = sym_state.get(sym, SymbolState())
+                if state.disabled_until_utc and now_utc() < state.disabled_until_utc:
+                    pyr_ok = False
+                    pyr_reason = f"Pyramiding disabled until {fmt_dt(state.disabled_until_utc)}"
+                else:
+                    pyr_ok, pyr_reason = can_add_pyramiding(cfg, sym)
+
+                # reversal decision (optional when pyramiding)
+                action = decide_reverse(pos_side, sigs, pL, pS, gate)
+                if (not cfg.pyramiding.allow_reverse_while_pyramiding) and state.adds > 0 and action != "HOLD":
+                    action = "HOLD"
+
                 if action != "HOLD" and not can_reverse:
-                    set_status(f"Reverse blocked (min-hold) {sym} pos={cur_side}")
+                    set_status(f"Reverse blocked (min-hold) {sym} pos={pos_side}")
                     if cfg.chatty:
-                        tg.send(f"⛔ Reverse blocked (min-hold)\n{sym} pos={cur_side}\nSignals={sigs}\npL={p_long:.3f} pS={p_short:.3f}")
+                        tg.send(f"⛔ Reverse blocked (min-hold)\n{sym} pos={pos_side}\nSignals={sigs}\npL={pL:.3f} pS={pS:.3f}")
+                    time.sleep(6)
                     continue
 
                 if action.startswith("CLOSE_AND_OPEN"):
                     new_dir = "BUY" if action.endswith("BUY") else "SELL"
-                    set_status(f"Reversing {sym} {cur_side}->{new_dir}")
+                    set_status(f"Reversing {sym} {pos_side}->{new_dir} (pL={pL:.3f} pS={pS:.3f})")
 
                     tg.send(
                         f"🔁 Reverse triggered\n"
-                        f"{sym} {cfg.entry_tf}\n"
-                        f"From {cur_side} to {new_dir}\n"
+                        f"{sym} {tf_entry}\n"
+                        f"From {pos_side} to {new_dir}\n"
                         f"Signals={sigs}\n"
-                        f"pL={p_long:.3f} pS={p_short:.3f}"
+                        f"p_long={pL:.3f} p_short={pS:.3f}"
                     )
 
                     if cfg.live_trading:
-                        close_all_positions_for_symbol(sym, cfg.magic, cfg.deviation)
+                        # close all positions on symbol
+                        for p in pos_list:
+                            close_position(p, cfg.magic, cfg.deviation)
 
-                        atr_val = float(df_entry.iloc[-1]["atr_14"])
-                        entry, sl, tp, sl_dist = build_sl_tp_from_atr(sym, new_dir, atr_val, cfg.sl_atr, cfg.tp_atr)
-
-                        # base risk for reversal entry
+                        entry, sl, tp, sl_dist = build_sl_tp(sym, new_dir, atr_val, cfg.sl_atr, cfg.tp_atr)
                         lots = calc_lot_size(sym, sl_dist, cfg.risk_per_trade)
                         place_order(sym, new_dir, sl, tp, lots, cfg.magic, cfg.deviation, comment=f"MLrev {new_dir}")
 
                         trades_today += 1
                         last_action_time = time.time()
                         entry_time_by_symbol[sym] = now_utc()
-                        last_add_time_by_symbol[sym] = time.time()
+                        sym_state[sym] = SymbolState(base_lot=lots, adds=0, last_add_ts=0.0)
 
                         tg.send(
                             f"✅ Reverse trade placed\n"
@@ -1285,86 +1573,110 @@ def main():
                         last_action_time = time.time()
                         tg.send("ℹ️ Alerts-only mode: reverse not executed, alert only.")
 
-                    did_action = True
-                    break  # action taken, restart loop
+                    time.sleep(6)
+                    continue
 
-                # If no reversal: consider scale-in (adds)
-                if cfg.scale_in_enabled and cfg.allow_multiple_positions_per_symbol:
-                    # Add only in same direction as current
-                    want_side = cur_side
-                    ok_add, reason = can_scale_in(
-                        sym, want_side, cfg, df_entry, p_long, p_short, last_add_time_by_symbol, factors
-                    )
-                    if ok_add:
-                        # Use existing SL/TP from first position if set, otherwise infer from ATR now.
-                        ref_sl = float(ps[0].sl) if ps[0].sl else 0.0
-                        ref_tp = float(ps[0].tp) if ps[0].tp else 0.0
-
-                        # If broker didn’t store SL/TP, fallback to ATR-based now (rare).
-                        atr_val = float(df_entry.iloc[-1]["atr_14"])
-                        tick = mt5.symbol_info_tick(sym)
-                        if tick is None:
-                            continue
-
-                        if ref_sl == 0.0 or ref_tp == 0.0:
-                            _, ref_sl, ref_tp, _ = build_sl_tp_from_atr(sym, want_side, atr_val, cfg.sl_atr, cfg.tp_atr)
-
-                        # Compute risk for this leg (bounded)
-                        leg_index = len(ps)  # next leg
-                        risk_leg = effective_risk_for_leg(cfg, leg_index, factors)
-
-                        # SL distance for sizing: distance from current entry price to shared SL
-                        entry_price = float(tick.ask) if want_side == "BUY" else float(tick.bid)
-                        sl_dist = abs(entry_price - ref_sl)
-                        lots = calc_lot_size(sym, sl_dist, risk_leg)
-
-                        set_status(f"Scale-in {sym} {want_side} leg={leg_index+1}/{cfg.max_positions_per_symbol}")
-                        tg.send(
-                            f"➕ Scale-in add\n"
-                            f"{sym} side={want_side} leg={leg_index+1}/{cfg.max_positions_per_symbol}\n"
-                            f"RiskLeg={risk_leg:.4f} Spread={get_spread_points(sym)}\n"
-                            f"pL={p_long:.3f} pS={p_short:.3f}\n"
-                            f"Using SL/TP: SL={ref_sl:.5f} TP={ref_tp:.5f}"
-                        )
-
-                        if cfg.live_trading:
-                            place_order(sym, want_side, ref_sl, ref_tp, lots, cfg.magic, cfg.deviation, comment=f"MLadd {want_side}")
-                            last_action_time = time.time()
-                            last_add_time_by_symbol[sym] = time.time()
-                            did_action = True
-                            break
+                # --- pyramiding add logic (controlled) ---
+                if cfg.pyramiding.enabled and pyr_ok and max_adds_dd > 0:
+                    # respect symbol state + cooldown + cap
+                    add_cap = min(cfg.pyramiding.max_adds_per_symbol, max_adds_dd)
+                    if state.adds < add_cap:
+                        if (time.time() - state.last_add_ts) < cfg.pyramiding.add_cooldown_seconds:
+                            set_status(f"Manage {sym}: add cooldown")
                         else:
-                            last_action_time = time.time()
-                            last_add_time_by_symbol[sym] = time.time()
-                            tg.send("ℹ️ Alerts-only mode: scale-in not executed, alert only.")
-                            did_action = True
-                            break
+                            # ensure ATR still ok + spread ok
+                            if spr > gate.max_spread_points:
+                                set_status(f"Manage {sym}: spread too high for add")
+                            elif atr_pts < gate.min_atr_points:
+                                set_status(f"Manage {sym}: ATR too low for add")
+                            else:
+                                # profit-in-ATR requirement
+                                # approximate using avg entry of current position(s)
+                                avg_entry, tot_vol = avg_entry_and_volume(pos_list)
+                                tick = mt5.symbol_info_tick(sym)
+                                if tick:
+                                    cur_price = tick.bid if pos_side == "BUY" else tick.ask
+                                    move = (cur_price - avg_entry) if pos_side == "BUY" else (avg_entry - cur_price)
+                                    move_atr = move / max(1e-9, atr_val)
+                                else:
+                                    move_atr = 0.0
+
+                                add_index = state.adds + 1
+                                required = ladder_required_threshold(cfg, sym, add_index)
+                                cur_conf = pL if pos_side == "BUY" else pS
+
+                                if move_atr < cfg.pyramiding.min_move_atr_to_add:
+                                    if cfg.chatty:
+                                        tg.send(
+                                            f"➕ Add blocked (not enough move)\n{sym} pos={pos_side}\n"
+                                            f"move_atr={move_atr:.2f} < {cfg.pyramiding.min_move_atr_to_add:.2f}\n"
+                                            f"conf={cur_conf:.3f} req={required:.3f}"
+                                        )
+                                elif cur_conf < required:
+                                    if cfg.chatty:
+                                        tg.send(
+                                            f"➕ Add blocked (confidence ladder)\n{sym} pos={pos_side}\n"
+                                            f"level={add_index}/{add_cap}\n"
+                                            f"conf={cur_conf:.3f} < req={required:.3f}\n"
+                                            f"Signals={sigs}"
+                                        )
+                                else:
+                                    # compute lot to add
+                                    if state.base_lot <= 0:
+                                        # fallback base lot = current total volume
+                                        state.base_lot = float(pos_list[0].volume)
+
+                                    sched = cfg.pyramiding.add_lot_schedule
+                                    mult = sched[min(add_index, len(sched)) - 1] if sched else 0.5
+                                    add_lot = max(0.01, round(state.base_lot * float(mult), 2))
+
+                                    # place add
+                                    direction = "BUY" if pos_side == "BUY" else "SELL"
+                                    entry, sl, tp, sl_dist = build_sl_tp(sym, direction, atr_val, cfg.sl_atr, cfg.tp_atr)
+
+                                    if cfg.live_trading:
+                                        place_order(sym, direction, sl, tp, add_lot, cfg.magic, cfg.deviation, comment=f"ADD{add_index}")
+                                        state.adds += 1
+                                        state.last_add_ts = time.time()
+                                        sym_state[sym] = state
+                                        last_action_time = time.time()
+
+                                        tg.send(
+                                            f"✅ Add executed\n{sym} {direction}\n"
+                                            f"Add level {add_index}/{add_cap}\n"
+                                            f"conf={cur_conf:.3f} req={required:.3f} move_atr={move_atr:.2f}\n"
+                                            f"lots={add_lot}\n"
+                                            f"SL/TP re-evaluated"
+                                        )
+
+                                        # sync basket SL/TP after add
+                                        sync_basket_sl_tp(cfg, sym, direction, atr_val, tg)
+                                    else:
+                                        tg.send(
+                                            f"📣 Add signal (alerts-only)\n{sym} {direction}\n"
+                                            f"level={add_index}/{add_cap} conf={cur_conf:.3f} req={required:.3f}"
+                                        )
+                                        state.adds += 1
+                                        state.last_add_ts = time.time()
+                                        sym_state[sym] = state
+                                        last_action_time = time.time()
+
                     else:
-                        if cfg.chatty:
-                            set_status(f"Holding {sym} {cur_side} (no add: {reason})")
+                        set_status(f"Manage {sym}: add cap reached ({state.adds}/{add_cap})")
+                else:
+                    set_status(f"Managing {sym} pos={pos_side} (no adds: {pyr_reason})")
 
-            if did_action:
                 time.sleep(6)
                 continue
 
-            # ---------------------------
-            # If positions exist and one_symbol_at_a_time is True, do not open new symbols
-            # ---------------------------
-            if open_symbols and cfg.one_symbol_at_a_time:
-                set_status("Managing open symbol; skipping new entries.")
-                time.sleep(6)
-                continue
-
-            # ---------------------------
-            # No open positions (or multi-symbol allowed): scan all for new entry
-            # ---------------------------
+            # --- If not one-symbol focus or no positions: scan entries ---
             scan_lines = []
             top_reasons = {}
             best = None
 
             for sym in ok_syms:
                 try:
-                    cand = score_symbol(sym, cfg, model_long, model_short)
+                    cand = score_symbol(sym, cfg, model_long, model_short, events_utc)
                 except Exception as e:
                     cand = {"symbol": sym, "ok": False, "reason": f"Data error: {e}"}
 
@@ -1374,18 +1686,21 @@ def main():
                     scan_lines.append(f"{sym}: ❌ {reason}")
                     continue
 
+                gate = cand["gate"]
+                th = gate.enter_th
+
                 if cand.get("best") is None:
                     scan_lines.append(
-                        f"{sym}: ⛔ no-entry | bias={cand['bias']} spr={cand['spread']}/{cand['max_spread_used']} "
-                        f"atr={cand['atr_pts']:.1f}/{cand['min_atr_used']} pL={cand['p_long']:.2f} pS={cand['p_short']:.2f} "
-                        f"th={cand['enter_th_used']:.2f}"
+                        f"{sym}: ⛔ no-entry | bias={cand['bias']} spr={cand['spread']}/{gate.max_spread_points} "
+                        f"atr={cand['atr_pts']:.1f}/{gate.min_atr_points} "
+                        f"pL={cand['p_long']:.2f} pS={cand['p_short']:.2f} th={th:.2f}"
                     )
                     continue
 
                 d, p, _ = cand["best"]
                 scan_lines.append(
-                    f"{sym}: ✅ {d} p={p:.3f} | bias={cand['bias']} spr={cand['spread']}/{cand['max_spread_used']} "
-                    f"atr={cand['atr_pts']:.1f}/{cand['min_atr_used']} th={cand['enter_th_used']:.2f}"
+                    f"{sym}: ✅ {d} p={p:.3f} | bias={cand['bias']} spr={cand['spread']}/{gate.max_spread_points} "
+                    f"atr={cand['atr_pts']:.1f}/{gate.min_atr_points} th={th:.2f}"
                 )
 
                 if best is None or cand["best"][2] > best["best"][2]:
@@ -1405,7 +1720,6 @@ def main():
                         f"Top reason: {common_reason or 'No valid setups / prob too low'}\n\n"
                         f"{last_scan_summary}"
                     )
-
                 time.sleep(10)
                 continue
 
@@ -1413,16 +1727,15 @@ def main():
             direction, best_p, _ = best["best"]
             atr_val = float(best["df_entry"].iloc[-1]["atr_14"])
 
-            entry, sl, tp, sl_dist = build_sl_tp_from_atr(sym, direction, atr_val, cfg.sl_atr, cfg.tp_atr)
+            entry, sl, tp, sl_dist = build_sl_tp(sym, direction, atr_val, cfg.sl_atr, cfg.tp_atr)
             lots = calc_lot_size(sym, sl_dist, cfg.risk_per_trade)
 
             set_status(f"Candidate {sym} {direction} p={best_p:.3f} lots={lots}")
 
             tg.send(
                 f"🏆 Candidate selected\n"
-                f"{sym} EntryTF={cfg.entry_tf} BiasTF={cfg.bias_tf} Bias={best['bias']}\n"
-                f"Dir={direction} p={best_p:.3f} Spread={best['spread']}/{best['max_spread_used']} ATR={best['atr_pts']:.1f}/{best['min_atr_used']}\n"
-                f"EnterTH={best['enter_th_used']:.2f}\n"
+                f"{sym} EntryTF={best['tf_entry']} BiasTF={cfg.bias_tf} Bias={best['bias']}\n"
+                f"Dir={direction} p={best_p:.3f} Spread={best['spread']} ATR={best['atr_pts']:.1f}\n"
                 f"Signals={best['signals']}\n"
                 f"Plan: lots={lots} entry~{entry:.5f} SL={sl:.5f} TP={tp:.5f}"
             )
@@ -1432,7 +1745,7 @@ def main():
                 trades_today += 1
                 last_action_time = time.time()
                 entry_time_by_symbol[sym] = now_utc()
-                last_add_time_by_symbol[sym] = time.time()
+                sym_state[sym] = SymbolState(base_lot=lots, adds=0, last_add_ts=0.0)
 
                 tg.send(
                     f"✅ Trade placed\n"
@@ -1449,7 +1762,7 @@ def main():
         except Exception as e:
             set_status(f"Error: {str(e)[:120]}")
             tg.send("❌ ERROR\n" + str(e) + "\n" + traceback.format_exc()[:3200])
-            time.sleep(20)
+            time.sleep(15)
 
 
 if __name__ == "__main__":
